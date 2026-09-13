@@ -1,0 +1,190 @@
+# ------------------------------------------------------------------------------------
+# High-Throughput CDC Lakehouse Demo
+#
+# Mirrors the architecture from the whitepaper at small scale:
+#   Postgres (OLTP, logical replication)
+#        -> Debezium (Kafka Connect) captures row-level changes
+#        -> Kafka (KRaft, single broker) is the durable, replayable CDC log
+#        -> Spark Structured Streaming appends CDC events into a Delta table
+#           (NO MERGE INTO — append-only, deterministic xxhash64 surrogate keys)
+#        -> a dynamic "gold" view resolves the latest row per account at read time
+#        -> a compaction job periodically applies Delta Deletion Vectors to
+#           soft-invalidate superseded rows without rewriting Parquet files
+#        -> a web dashboard (dashboard/) lets you inject test data and watch
+#           the whole pipeline (Postgres -> silver -> gold) update live
+# ------------------------------------------------------------------------------------
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16}
+    container_name: cdc-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sourcedb
+      POSTGRES_USER: cdc_user
+      POSTGRES_PASSWORD: cdc_pass
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cdc_user -d sourcedb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Official Apache Kafka image (KRaft mode, single combined broker+controller
+  # node) -- bitnami/kafka's simple version tags were pruned from Docker Hub
+  # in 2025, so we use the project's own multi-arch image instead.
+  kafka:
+    image: ${KAFKA_IMAGE:-apache/kafka:3.8.0}
+    container_name: cdc-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@cdc-kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://cdc-kafka:9092,EXTERNAL://localhost:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+    ports:
+      - "9094:9094"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  connect:
+    image: ${DEBEZIUM_IMAGE:-quay.io/debezium/connect:latest}
+    container_name: cdc-connect
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: "cdc-kafka:9092"
+      GROUP_ID: "cdc-connect-cluster"
+      CONFIG_STORAGE_TOPIC: "_connect_configs"
+      OFFSET_STORAGE_TOPIC: "_connect_offsets"
+      STATUS_STORAGE_TOPIC: "_connect_status"
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "8083:8083"
+
+  # Idle Spark container used for one-off/admin jobs, triggered either
+  # manually (`docker compose exec spark spark-submit ...`) or from the
+  # dashboard's admin buttons (deletion-vector compaction, Spark-SQL gold view).
+  spark:
+    build:
+      context: ./spark
+    container_name: cdc-spark
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    volumes:
+      - ./spark/jobs:/opt/jobs
+      - ./data:/opt/data
+      - spark_ivy_cache:/opt/ivy_cache
+    command: ["tail", "-f", "/dev/null"]
+
+  # Always-on Spark Structured Streaming ingestion: Kafka -> Delta silver
+  # table, 10s micro-batches, append-only. This is what makes test data
+  # submitted via the dashboard show up automatically without any manual step.
+  spark-streamer:
+    build:
+      context: ./spark
+    container_name: cdc-spark-streamer
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    volumes:
+      - ./spark/jobs:/opt/jobs
+      - ./data:/opt/data
+      - spark_ivy_cache:/opt/ivy_cache
+    command:
+      - "spark-submit"
+      - "--packages"
+      - "io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
+      - "--conf"
+      - "spark.jars.ivy=/opt/ivy_cache"
+      - "/opt/jobs/streaming_ingest.py"
+      - "--mode"
+      - "stream"
+
+  generator:
+    build:
+      context: ./generator
+    container_name: cdc-generator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: cdc-postgres
+      PGPORT: "5432"
+      PGDATABASE: sourcedb
+      PGUSER: cdc_user
+      PGPASSWORD: cdc_pass
+    profiles: ["tools"]  # only runs when explicitly invoked via `docker compose run generator ...`
+
+  # Web dashboard: monitors Postgres/silver/gold + lets you submit test
+  # mutations from a form. Talks to Postgres and reads the Delta table
+  # directly (no Spark needed for reads); uses the Docker socket to trigger
+  # the admin Spark jobs on demand. See dashboard/README section in the
+  # top-level README for a security note about the Docker socket mount.
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: api/Dockerfile
+    container_name: cdc-dashboard
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      PGHOST: cdc-postgres
+      PGPORT: "5432"
+      PGDATABASE: sourcedb
+      PGUSER: cdc_user
+      PGPASSWORD: cdc_pass
+      CONNECT_URL: "http://cdc-connect:8083"
+      SPARK_CONTAINER: "cdc-spark"
+      SPARK_STREAMER_CONTAINER: "cdc-spark-streamer"
+      KAFKA_BOOTSTRAP: "cdc-kafka:9092"
+      SILVER_PATH: "/opt/data/silver/accounting_cdc_staging"
+    volumes:
+      - ./data:/opt/data:ro
+      - ./dashboard/static:/app/static:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8000:8000"
+
+volumes:
+  pg_data:
+  kafka_data:
+  spark_ivy_cache:

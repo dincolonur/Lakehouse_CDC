@@ -1,0 +1,8 @@
+data/silver/
+data/checkpoints/
+data/spark-warehouse/
+*.pyc
+__pycache__/
+.DS_Store
+.env
+.idea/

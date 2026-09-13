@@ -1,0 +1,26 @@
+{
+  "name": "accounting-postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "cdc-postgres",
+    "database.port": "5432",
+    "database.user": "cdc_user",
+    "database.password": "cdc_pass",
+    "database.dbname": "sourcedb",
+    "topic.prefix": "cdc",
+    "plugin.name": "pgoutput",
+    "publication.name": "cdc_publication",
+    "publication.autocreate.mode": "filtered",
+    "slot.name": "cdc_slot",
+    "table.include.list": "public.accounting",
+
+    "tombstones.on.delete": "false",
+
+    "decimal.handling.mode": "double",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false"
+  }
+}

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CDC Lakehouse Demo</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>High-Throughput CDC Lakehouse — Demo Console</h1>
+    <div id="status-bar" class="status-bar">
+      <span class="last-refresh">Last refresh: <span id="last-refresh">—</span></span>
+      <label class="auto-refresh">
+        <input type="checkbox" id="auto-refresh" checked />
+        Auto-refresh every <select id="refresh-interval">
+          <option value="3000">3s</option>
+          <option value="5000" selected>5s</option>
+          <option value="10000">10s</option>
+        </select>
+      </label>
+      <button id="refresh-now">Refresh now</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Pipeline — every stage, live</h2>
+      <p class="hint">
+        Postgres (OLTP) → Debezium (CDC capture) → Kafka (durable log) → Spark streamer
+        (append-only ingest) → Silver (Delta, raw) → Gold (deduped, read-time). Each
+        card reflects the current state of that stage.
+      </p>
+      <div class="pipeline" id="pipeline">
+        <div class="step" id="step-postgres">
+          <div class="step-dot"></div>
+          <div class="step-name">Postgres</div>
+          <div class="step-detail" id="step-postgres-detail">…</div>
+        </div>
+        <div class="step-arrow">→</div>
+        <div class="step" id="step-connect">
+          <div class="step-dot"></div>
+          <div class="step-name">Debezium</div>
+          <div class="step-detail" id="step-connect-detail">…</div>
+        </div>
+        <div class="step-arrow">→</div>
+        <div class="step" id="step-kafka">
+          <div class="step-dot"></div>
+          <div class="step-name">Kafka</div>
+          <div class="step-detail" id="step-kafka-detail">…</div>
+        </div>
+        <div class="step-arrow">→</div>
+        <div class="step" id="step-streamer">
+          <div class="step-dot"></div>
+          <div class="step-name">Spark streamer</div>
+          <div class="step-detail" id="step-streamer-detail">…</div>
+        </div>
+        <div class="step-arrow">→</div>
+        <div class="step" id="step-silver-pipe">
+          <div class="step-dot"></div>
+          <div class="step-name">Silver</div>
+          <div class="step-detail" id="step-silver-pipe-detail">…</div>
+        </div>
+        <div class="step-arrow">→</div>
+        <div class="step" id="step-gold-pipe">
+          <div class="step-dot"></div>
+          <div class="step-name">Gold</div>
+          <div class="step-detail" id="step-gold-pipe-detail">…</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>1 · Inject test data (OLTP → Postgres)</h2>
+      <p class="hint">
+        Submitted here goes straight into Postgres, exactly like a real application write.
+        Debezium picks it up from the write-ahead log and publishes it to Kafka; the
+        always-on Spark streamer appends it to the Delta silver table within one
+        micro-batch (~10s). Watch it show up below.
+      </p>
+      <form id="mutate-form" class="inline-form">
+        <select name="action" id="action-select">
+          <option value="insert">Insert</option>
+          <option value="update">Update</option>
+          <option value="delete">Delete</option>
+        </select>
+        <label>account_id <input type="number" name="account_id" id="account_id" required /></label>
+        <label id="balance-field">balance <input type="number" step="0.01" name="balance" id="balance" /></label>
+        <button type="submit">Submit to Postgres</button>
+        <span id="mutate-result" class="result"></span>
+      </form>
+
+      <form id="generate-form" class="inline-form">
+        <label>random mutations <input type="number" name="events" value="10" min="1" max="200" /></label>
+        <button type="submit">Generate burst</button>
+        <span id="generate-result" class="result"></span>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>2 · Pipeline admin actions</h2>
+      <p class="hint">
+        These run the real Spark/Delta jobs (via <code>docker exec</code> into the
+        <code>spark</code> container) — useful to see Delta Deletion Vectors and the
+        Spark-SQL gold view in action. They can take 10-30s the first time (dependency
+        download).
+      </p>
+      <div class="inline-form">
+        <button id="btn-compact">Run deletion-vector compaction</button>
+        <button id="btn-gold-view">Refresh Spark-SQL gold view</button>
+      </div>
+      <pre id="action-log" class="log" hidden></pre>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <h2>Source — Postgres <code>accounting</code> <span class="count" id="source-count"></span></h2>
+        <div class="table-wrap"><table id="source-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h2>Silver — raw append-only Delta events <span class="count" id="silver-count"></span></h2>
+        <p class="hint">Every INSERT/UPDATE/DELETE is preserved; duplicates and replays are expected here.</p>
+        <div class="table-wrap"><table id="silver-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h2>Gold — deduped, read-time view <span class="count" id="gold-count"></span></h2>
+        <p class="hint">One row per account_id — the highest source_commit_lsn wins, deletes filtered out. Recomputed on every refresh; nothing is rewritten to get here.</p>
+        <div class="table-wrap"><table id="gold-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
